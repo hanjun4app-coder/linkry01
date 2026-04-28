@@ -1,0 +1,125 @@
+version: '3.8'
+
+services:
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:15-alpine
+    container_name: elderly-care-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-elderly_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_production}
+      POSTGRES_DB: ${POSTGRES_DB:-elderly_care}
+      TZ: Asia/Shanghai
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # 数据持久化
+      - postgres_data:/var/lib/postgresql/data
+      # 初始化脚本（可选）
+      # - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      # 注释掉这行，让 FastAPI 启动时通过 SQLAlchemy 创建所有表
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-elderly_admin} -d ${POSTGRES_DB:-elderly_care}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - elderly-care-network
+    restart: unless-stopped
+
+  # FastAPI 应用
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: elderly-care-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # 数据库
+      POSTGRES_USER: ${POSTGRES_USER:-elderly_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_production}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-elderly_care}
+
+      # FastAPI
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      API_WORKERS: 4
+      DEBUG: ${DEBUG:-False}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # 安全配置
+      SECRET_KEY: ${SECRET_KEY:-your_secret_key_change_in_production}
+      API_KEY: ${API_KEY:-your_api_key_change_in_production}
+
+      # 告警规则阈值
+      INACTIVITY_THRESHOLD_MINUTES: ${INACTIVITY_THRESHOLD_MINUTES:-240}
+      BATHROOM_TIMEOUT_MINUTES: ${BATHROOM_TIMEOUT_MINUTES:-30}
+      WAKE_TIME_VARIANCE_HOURS: ${WAKE_TIME_VARIANCE_HOURS:-2}
+      NIGHT_ACTIVITY_THRESHOLD: ${NIGHT_ACTIVITY_THRESHOLD:-5}
+      ROOM_ACTIVITY_DEVIATION_PERCENT: ${ROOM_ACTIVITY_DEVIATION_PERCENT:-50}
+    ports:
+      - "8000:8000"
+    volumes:
+      # 代码挂载（开发模式）
+      - ./app:/app/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - elderly-care-network
+    restart: unless-stopped
+
+  # Redis（可选，用于缓存和消息队列）
+  redis:
+    image: redis:7-alpine
+    container_name: elderly-care-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - elderly-care-network
+    restart: unless-stopped
+    # 仅在需要时启用，默认关闭
+    profiles:
+      - optional
+
+  # pgAdmin（PostgreSQL 管理界面，仅用于开发）
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: elderly-care-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - elderly-care-network
+    restart: unless-stopped
+    # 仅在开发模式启用
+    profiles:
+      - dev
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  elderly-care-network:
+    driver: bridge

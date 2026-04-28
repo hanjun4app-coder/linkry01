@@ -1,0 +1,193 @@
+# Home Assistant 集成示例
+# 将此配置添加到 Home Assistant 的 configuration.yaml 中
+
+homeassistant:
+  customize:
+    # 老人和家庭信息（通过 input_helper）
+    input_text.elder_id:
+      friendly_name: "老人 ID"
+      icon: mdi:account
+    input_text.family_id:
+      friendly_name: "家庭 ID"
+      icon: mdi:home-group
+
+# 输入助手（用于存储配置信息）
+input_text:
+  elder_id:
+    name: Elder ID
+    initial: "elder_001"
+  family_id:
+    name: Family ID
+    initial: "family_001"
+  api_key:
+    name: API Key
+    initial: "your_api_key_here"
+    icon: mdi:key
+
+# REST 命令（发送事件到我们的 API）
+rest_command:
+  send_to_elderly_care_api:
+    url: "http://elderly-care-api:8000/api/events"
+    method: POST
+    content_type: "application/json"
+    headers:
+      x-api-key: "{{ states('input_text.api_key') }}"
+    payload: |
+      {
+        "elder_id": "{{ states('input_text.elder_id') }}",
+        "family_id": "{{ states('input_text.family_id') }}",
+        "device_id": "{{ device_id }}",
+        "device_type": "{{ device_type }}",
+        "event_type": "{{ event_type }}",
+        "event_value": {{ event_value | tojson }},
+        "room": "{{ room }}",
+        "confidence": 0.95,
+        "timestamp": "{{ now().isoformat() }}"
+      }
+
+# 示例 1: Aqara FP2 运动检测事件
+automation:
+  - alias: "Aqara FP2 运动检测 -> 云端 API"
+    description: "当卧室 FP2 检测到运动时，发送到云端"
+    trigger:
+      platform: state
+      entity_id: binary_sensor.aqara_fp2_bedroom_motion  # 根据实际修改
+      to: "on"
+    action:
+      - service: rest_command.send_to_elderly_care_api
+        data:
+          device_id: "aqara_fp2_bedroom"
+          device_type: "aqara_fp2"
+          event_type: "motion"
+          event_value: |
+            {
+              "detected": true,
+              "distance": {{ state_attr('binary_sensor.aqara_fp2_bedroom_motion', 'distance') | default(0) }},
+              "illuminance": {{ state_attr('binary_sensor.aqara_fp2_bedroom_motion', 'illuminance') | default(0) }}
+            }
+          room: "bedroom"
+
+  # 示例 2: 门磁传感器事件
+  - alias: "门磁传感器 -> 云端 API"
+    description: "当卫生间门打开/关闭时，发送到云端"
+    trigger:
+      platform: state
+      entity_id: binary_sensor.bathroom_door_sensor
+      to:
+        - "on"
+        - "off"
+    action:
+      - service: rest_command.send_to_elderly_care_api
+        data:
+          device_id: "bathroom_door_sensor"
+          device_type: "door_sensor"
+          event_type: "door"
+          event_value: |
+            {
+              "opened": {{ (trigger.to_state.state == "on") | tojson }},
+              "sensor_name": "bathroom_door"
+            }
+          room: "bathroom"
+
+  # 示例 3: 温湿度传感器事件
+  - alias: "温湿度传感器 -> 云端 API"
+    description: "定期发送卧室温湿度数据"
+    trigger:
+      platform: time_pattern
+      minutes: "/5"  # 每 5 分钟
+    condition:
+      - condition: state
+        entity_id: input_text.elder_id
+        state: "elder_001"  # 仅为该老人发送
+    action:
+      - service: rest_command.send_to_elderly_care_api
+        data:
+          device_id: "bedroom_temp_humidity"
+          device_type: "temp_humidity"
+          event_type: "temperature"
+          event_value: |
+            {
+              "temperature": {{ states('sensor.bedroom_temperature') | float(20) }},
+              "humidity": {{ states('sensor.bedroom_humidity') | float(50) }},
+              "pressure": {{ states('sensor.bedroom_pressure') | float(1013) }}
+            }
+          room: "bedroom"
+
+  # 示例 4: 检测到不活动时的主动告警
+  - alias: "长时间无活动告警"
+    description: "如果4小时没有运动检测，发送告警"
+    trigger:
+      platform: time_pattern
+      minutes: "/30"  # 每30分钟检查一次
+    condition:
+      - condition: template
+        value_template: |
+          {% set last_motion = as_timestamp(states.binary_sensor.aqara_fp2_bedroom_motion.last_changed) %}
+          {% set now = as_timestamp(now()) %}
+          {{ (now - last_motion) > 14400 }}  # 4 小时 = 14400 秒
+    action:
+      - service: notify.mobile_app_iphone  # 需要配置通知服务
+        data:
+          title: "⚠️ 老人活动异常"
+          message: "过去4小时内未检测到任何运动"
+
+  # 示例 5: 自动计算行为模式（每天凌晨1点）
+  - alias: "每日计算行为模式"
+    description: "自动分析过去7天的数据并更新基线"
+    trigger:
+      platform: time
+      at: "01:00:00"
+    action:
+      - service: rest.post_url
+        data:
+          url: "http://elderly-care-api:8000/api/patterns/{{ states('input_text.elder_id') }}/calculate"
+          headers:
+            x-api-key: "{{ states('input_text.api_key') }}"
+          payload: |
+            {
+              "family_id": "{{ states('input_text.family_id') }}",
+              "pattern_type": "activity"
+            }
+
+# 脚本：手动发送测试事件
+script:
+  send_test_event_to_api:
+    description: "发送测试事件到云端 API"
+    fields:
+      event_type:
+        description: "事件类型"
+        example: "motion"
+      device_id:
+        description: "设备 ID"
+        example: "test_device"
+    sequence:
+      - service: rest_command.send_to_elderly_care_api
+        data:
+          device_id: "{{ device_id }}"
+          device_type: "custom"
+          event_type: "{{ event_type }}"
+          event_value: |
+            {
+              "test": true,
+              "timestamp": "{{ now().isoformat() }}"
+            }
+          room: "test"
+
+# Sensor：从 API 读取老人状态（可选）
+template:
+  - sensor:
+      - name: "老人未确认告警数"
+        unique_id: "elderly_unacknowledged_alerts"
+        unit_of_measurement: "count"
+        state: |
+          {% set alert_count = namespace(value=0) %}
+          {# 这里需要集成 REST API 读取 #}
+          {{ alert_count.value }}
+
+  - sensor:
+      - name: "老人今日活动"
+        unique_id: "elderly_daily_activity"
+        unit_of_measurement: "分钟"
+        state: |
+          {# 这里需要集成 REST API 读取 #}
+          0

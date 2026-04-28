@@ -1,0 +1,356 @@
+================================================================================
+ELDERLY CARE AI SYSTEM - SECURITY HARDENING DEPLOYMENT CHECKLIST
+================================================================================
+Date: ________________    Deployed By: _________________    Duration: ________
+
+PRE-DEPLOYMENT PHASE (Complete BEFORE making any changes)
+================================================================================
+
+SECTION 1: Planning & Preparation
+  [ ] Read DEPLOYMENT_GUIDE.md completely
+  [ ] Read SECURITY_FIXES_SUMMARY.md for context
+  [ ] Schedule maintenance window (5-10 mins downtime)
+  [ ] Notify stakeholders of planned maintenance
+  [ ] Prepare rollback procedures
+  [ ] Check current deployment status: _______________
+
+SECTION 2: Generate Security Keys (Run on secure machine, NOT in deployment env)
+  [ ] Generate SECRET_KEY:
+      Run: python3 -c "import secrets; import base64; key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(); print(f'SECRET_KEY={key}')"
+      Output: ________________________________________________________________
+
+  [ ] Generate API_KEY:
+      Run: python3 -c "import secrets; import base64; key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(); print(f'API_KEY={key}')"
+      Output: ________________________________________________________________
+
+  [ ] Generate HOME_ASSISTANT_WEBHOOK_SECRET:
+      Run: python3 -c "import secrets; secret = secrets.token_hex(32); print(f'HOME_ASSISTANT_WEBHOOK_SECRET={secret}')"
+      Output: ________________________________________________________________
+
+SECTION 3: Environment Configuration
+  [ ] Edit .env file with generated keys (DO NOT commit to git!)
+      SECRET_KEY=______________________________________________________
+      API_KEY=_________________________________________________________
+
+  [ ] Configure ALLOW_ORIGINS for your domains (comma-separated):
+      ALLOW_ORIGINS=["https://app.domain.com", "https://dashboard.domain.com", ...]
+
+  [ ] Verify no hardcoded secrets in code:
+      Run: grep -r "change_me_in_production" app/
+      Expected: 0 results ✓
+
+  [ ] Verify no default API keys:
+      Run: grep -r "your_random_api_key" app/
+      Expected: 0 results ✓
+
+SECTION 4: Database Preparation
+  [ ] Create database backup:
+      Command: pg_dump -U elderly_admin -h postgres elderly_care > elderly_care_backup_$(date +%Y%m%d_%H%M%S).sql
+      Backup file: ______________________________________________________
+      Backup verified: [ ] Yes [ ] No
+
+  [ ] Verify backup accessibility and size: ________________
+  [ ] Test backup restoration on test database (optional but recommended)
+
+DEPLOYMENT PHASE (Execute during maintenance window)
+================================================================================
+
+SECTION 5: Dependencies Installation
+  [ ] Install PyJWT library:
+      Run: pip install PyJWT>=2.8.0
+      Verify: pip show PyJWT
+      Version: ____________
+
+  [ ] Update requirements.txt with new dependency
+  [ ] Commit dependency changes to version control
+
+SECTION 6: Code Deployment
+  [ ] Deploy new/modified files:
+      [ ] app/security.py (NEW FILE)
+      [ ] app/config.py (MODIFIED)
+      [ ] app/main.py (MODIFIED)
+      [ ] app/models.py (MODIFIED)
+      [ ] app/rules.py (MODIFIED)
+      [ ] app/routes/events.py (MODIFIED)
+      [ ] app/routes/alerts.py (MODIFIED)
+      [ ] .env.example (MODIFIED - no credentials)
+
+  [ ] Verify all files deployed:
+      Run: ls -la app/security.py (should exist)
+      Run: grep "import PyJWT" app/security.py (should find import)
+
+  [ ] Check git diff for unintended changes:
+      Run: git diff
+      Review: All changes intentional? [ ] Yes [ ] No
+
+SECTION 7: Database Migration
+  [ ] Copy migration script to database server:
+      File: migrations/001_security_hardening.sql
+      Destination: ______________________________________________________
+
+  [ ] Apply migration to PostgreSQL:
+      Run: psql -U elderly_admin -d elderly_care < migrations/001_security_hardening.sql
+      Or:  docker exec elderly-care-postgres psql -U elderly_admin -d elderly_care < migrations/001_security_hardening.sql
+
+      Status: [ ] Success [ ] Failed
+      If failed, check error: _____________________________________________
+
+  [ ] Verify migration success (run these SQL queries):
+
+      Query 1 - Check Elder constraint:
+      \d elders
+      ✓ Should show: uq_family_elder UNIQUE CONSTRAINT (family_id, elder_id)
+
+      Query 2 - Check Device constraint:
+      \d devices
+      ✓ Should show: uq_family_device UNIQUE CONSTRAINT (family_id, device_id)
+
+      Query 3 - Check Alert indexes:
+      \d alerts
+      ✓ Should show: idx_alert_dedup, idx_alert_unacked
+
+      Query 4 - Verify backward compatibility (test duplicate prevention):
+      INSERT INTO families VALUES (999, 'test_fam_999', 'Test', 'Desc', now(), now());
+      INSERT INTO elders VALUES (9999, 'test_elder', 'test_fam_999', 'John', 80, 'M', '{}', 'collecting', 0, null, now(), now());
+      INSERT INTO elders VALUES (9998, 'test_elder', 'test_fam_999', 'Jane', 75, 'F', '{}', 'collecting', 0, null, now(), now());
+      ✓ Should return: ERROR - duplicate key violates constraint "uq_family_elder"
+
+      Clean up test data:
+      DELETE FROM families WHERE family_id = 'test_fam_999';
+
+SECTION 8: Application Restart
+  [ ] Stop current API service:
+      Run: pkill -f uvicorn
+      Or:  docker stop elderly-care-api
+
+  [ ] Wait 5 seconds for clean shutdown
+
+  [ ] Start new API service:
+      Run: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+      Or:  docker start elderly-care-api
+
+  [ ] Verify service started:
+      [ ] Check logs for startup message
+      Run: docker logs elderly-care-api | grep "✅ Elderly Care Cloud API started"
+
+      If failed - CRITICAL:
+      [ ] Check for errors in logs
+      [ ] Review SECRET_KEY/API_KEY configuration
+      [ ] Verify PyJWT installation
+      Error details: ___________________________________________________________
+
+POST-DEPLOYMENT PHASE (Verify everything works)
+================================================================================
+
+SECTION 9: Security Verification
+
+  SUBSECTION 9A: Environment & Secrets
+    [ ] Verify no hardcoded secrets exposed:
+        Run: grep -r "CHANGE_IN_PRODUCTION" app/
+        Expected: Only in .env.example and comments ✓
+
+    [ ] Verify environment variables loaded:
+        Run: curl http://localhost:8000/version
+        Should return: 200 OK with version info
+
+  SUBSECTION 9B: JWT Token Generation & Testing
+    [ ] Generate JWT token for testing:
+        Create test_token.py:
+        ```python
+        from app.security import create_access_token
+        from datetime import timedelta
+        token = create_access_token("test_family_001", "test_device", timedelta(hours=24))
+        print(f"Token: {token}")
+        ```
+        Run: python test_token.py
+        Token generated: [ ] Yes [ ] No
+        Token: ________________________________________________________________
+
+    [ ] Test API with JWT token:
+        Run: curl -X GET "http://localhost:8000/api/alerts?family_id=test_family_001&days=7" \
+             -H "Authorization: Bearer <YOUR_TOKEN>"
+        Response: [ ] 200 OK [ ] 401 Unauthorized [ ] Other: ___
+
+    [ ] Test API without JWT token (should fail):
+        Run: curl -X GET "http://localhost:8000/api/alerts?family_id=test_family_001"
+        Response: [ ] 401 Unauthorized ✓ [ ] 200 OK (PROBLEM!)
+
+  SUBSECTION 9C: CORS Configuration
+    [ ] Test CORS from allowed origin:
+        Run: curl -X OPTIONS http://localhost:8000/api/alerts \
+             -H "Origin: https://app.domain.com" -v
+        Check response headers for: access-control-allow-origin
+        Header present: [ ] Yes ✓ [ ] No
+
+    [ ] Test CORS from disallowed origin (should fail):
+        Run: curl -X OPTIONS http://localhost:8000/api/alerts \
+             -H "Origin: https://attacker.com" -v
+        CORS headers should NOT appear in response
+        Correct behavior: [ ] Yes ✓ [ ] No
+
+  SUBSECTION 9D: PII Logging Protection
+    [ ] Check that logs don't contain raw PII:
+        Run: docker logs elderly-care-api | grep -E "(EMAIL_MASKED|IP_MASKED|PHONE_MASKED)"
+        Should find masked entries: [ ] Yes ✓
+
+        Run: docker logs elderly-care-api | grep -E "[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"
+        Should find 0 IP addresses: [ ] Correct ✓
+
+  SUBSECTION 9E: Error Response Security
+    [ ] Verify error responses don't expose stack traces:
+        Trigger an error (e.g., invalid alert ID):
+        Run: curl -X POST "http://localhost:8000/api/alerts/999999/acknowledge?acknowledged_by=test" \
+             -H "Authorization: Bearer <TOKEN>"
+        Response should show:
+        {
+          "error_code": "...",
+          "error_message": "...",
+          "error_id": "550e8400-..."  ← This unique ID allows support tracking
+        }
+        ✓ No Python traceback visible: [ ] Yes [ ] No
+
+  SUBSECTION 9F: Home Assistant Webhook (if using HA integration)
+    [ ] Test webhook with valid signature:
+        Create test_webhook.py with valid HMAC-SHA256 signature
+        Run: python test_webhook.py
+        Response: [ ] 200 success ✓ [ ] 401 Unauthorized
+
+    [ ] Test webhook with invalid signature (should reject):
+        Modify signature to be wrong
+        Response: [ ] 401 Unauthorized ✓ [ ] 200 success (PROBLEM!)
+
+SECTION 10: Performance Verification
+  [ ] Check query performance (room pattern detection should be ~5-10ms):
+      Monitor database logs or APM tool
+      Query time: ____________ms  (Target: < 10ms ✓)
+
+  [ ] Verify alert queries use indexes:
+      Run: EXPLAIN ANALYZE SELECT * FROM alerts WHERE family_id = 'test_family_001' AND is_acknowledged = false;
+      Should show "Index Scan" not "Seq Scan": [ ] Yes ✓ [ ] No
+
+SECTION 11: API Endpoint Testing
+  [ ] Test critical endpoints:
+
+      GET /api/alerts (list alerts)
+      [ ] Works with JWT: [ ] Yes [ ] No
+      [ ] Returns 401 without JWT: [ ] Yes [ ] No
+
+      GET /api/alerts/unacknowledged (unacked alerts)
+      [ ] Works with JWT: [ ] Yes [ ] No
+
+      POST /api/alerts/{id}/acknowledge (acknowledge alert)
+      [ ] Works with JWT: [ ] Yes [ ] No
+
+      POST /api/events (create event)
+      [ ] Works with JWT: [ ] Yes [ ] No
+      [ ] Validates family_id: [ ] Yes [ ] No
+
+      GET /api/alerts/{family_id}/statistics (statistics)
+      [ ] Works with JWT: [ ] Yes [ ] No
+
+SECTION 12: Health Check
+  [ ] Service health endpoints (no auth required):
+      GET /health
+      Response: [ ] 200 {"status": "ok"} ✓
+
+      GET /version
+      Response: [ ] 200 with version info ✓
+
+      GET /
+      Response: [ ] 200 with API info ✓
+
+SECTION 13: Logs Review
+  [ ] Check for any error messages:
+      Run: docker logs elderly-care-api | grep ERROR
+      Expected: 0 errors (or only expected startup messages)
+      Found errors: ___________________________________________________________
+
+  [ ] Check for warnings:
+      Run: docker logs elderly-care-api | grep WARNING
+      Expected: 0 warnings
+      Found warnings: ________________________________________________________
+
+SECTION 14: Client Testing
+  [ ] Test with real frontend application:
+      [ ] Frontend can obtain JWT token
+      [ ] Frontend can query alerts with JWT
+      [ ] Token expiration is handled gracefully
+      [ ] CORS headers allow frontend domain
+
+  [ ] Test with mobile app (if applicable):
+      [ ] Mobile client can authenticate
+      [ ] Mobile can receive events/alerts
+      [ ] Signature verification works (if using push)
+
+VERIFICATION COMPLETE
+================================================================================
+
+SECTION 15: Final Verification & Sign-Off
+
+  [ ] All database changes applied successfully
+  [ ] All code deployed and running
+  [ ] All security tests passed
+  [ ] All API endpoints functional
+  [ ] Logs clean of errors and PII
+  [ ] Performance meets targets
+  [ ] CORS configured correctly
+  [ ] JWT working end-to-end
+  [ ] Backups accessible and tested
+  [ ] Rollback plan documented
+
+DEPLOYMENT SUMMARY
+================================================================================
+
+Start Time: ____________________
+End Time:   ____________________
+Total Duration: ________________
+
+Issues Encountered: [ ] None [ ] Minor [ ] Major
+
+If issues: _____________________________________________________________________
+
+Deployed By: _______________________________    Date: ________________
+Verified By: _______________________________    Date: ________________
+
+Rollback Required? [ ] Yes [ ] No
+If yes, executed at: ____________________
+
+CRITICAL CONTACTS
+================================================================================
+Database Team:    _________________________    Phone: ________________
+Backend Team:     _________________________    Phone: ________________
+Security Team:    _________________________    Phone: ________________
+On-Call Support:  _________________________    Phone: ________________
+
+APPENDIX: Common Issues & Quick Fixes
+================================================================================
+
+ISSUE: "Token verification failed"
+FIX: 1) Verify SECRET_KEY matches in .env
+     2) Restart API service
+     3) Generate fresh token
+
+ISSUE: "CORS error after deployment"
+FIX: 1) Check ALLOW_ORIGINS in .env (includes your domain?)
+     2) Restart API service
+     3) Clear browser cache
+
+ISSUE: "Database migration failed with constraint error"
+FIX: 1) Restore from backup
+     2) Check for duplicate (family_id, elder_id) pairs
+     3) Clean data and re-run migration
+
+ISSUE: "Webhook returns 401 Unauthorized"
+FIX: 1) Verify HOME_ASSISTANT_WEBHOOK_SECRET matches
+     2) Check HA is computing correct SHA256
+     3) Verify request body encoding
+
+ISSUE: "API won't start after deployment"
+FIX: 1) Check PyJWT is installed: pip show PyJWT
+     2) Verify SECRET_KEY/API_KEY in .env
+     3) Check logs: docker logs elderly-care-api
+     4) Restore previous code version if needed
+
+================================================================================
+END OF CHECKLIST
+================================================================================

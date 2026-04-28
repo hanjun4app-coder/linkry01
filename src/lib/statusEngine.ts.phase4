@@ -1,0 +1,470 @@
+/**
+ * ✨ PHASE 4 ENHANCED: Status Engine with Alert Presentation Layer
+ *
+ * This version integrates the alertPresentation layer to transform
+ * engineering outputs into calm, consumer-friendly alerts.
+ *
+ * Key change: Instead of showing raw BehaviorEvent with confidence_score,
+ * we now show PresentedAlert with soft language and simple categories.
+ */
+
+import {
+  BehaviorEvent,
+  DailyBehaviorSummaryInput,
+  RiskLevel,
+} from '@/types/behavior';
+import { StatusViewModel } from '@/types/status';
+import {
+  generateBehaviorText,
+  generateDailySummaryText,
+  getCurrentStateLabel,
+  isAlertEvent,
+} from './behaviorText';
+import {
+  generateStateContext,
+  getStateNoticeText,
+} from './stateEngine';
+
+// ✨ Phase 3: Sensor fusion imports
+import {
+  analyzeAllAnomalies,
+} from '@/lib/sensorFusion';
+import { SENSOR_CONFIG } from '@/config/sensorConfig';
+import {
+  SensorSnapshot,
+  SensorHistory,
+  AnomalyEvent,
+  FP2SensorData,
+  SleepTrackerData,
+  DoorSensorData,
+  HallwaySensorData,
+} from '@/types/sensor';
+import { shouldPushAlert } from '@/lib/alertPipeline';
+import { calculateConfidenceScore } from '@/lib/confidenceScorer';
+
+// ✨ Phase 4: Alert presentation layer
+import {
+  selectPrimaryAlert,
+  countSuppressedAlerts,
+  PresentedAlert,
+  ConsumerAlertLevel,
+} from '@/lib/alertPresentation';
+
+// ... (All Phase 3 helper functions remain the same) ...
+// [constructCurrentSensorSnapshot, constructSensorHistory, etc.]
+
+/**
+ * ✨ NEW Phase 4: Convert BehaviorEvent to PresentedAlert
+ * This uses the alertPresentation layer to transform internal outputs
+ */
+function getPrimaryPresentedAlert(
+  events: BehaviorEvent[],
+  language: 'en' | 'zh' = 'en'
+): PresentedAlert | null {
+  if (events.length === 0) {
+    return null;
+  }
+
+  // Use alertPresentation layer to select and transform
+  // This handles:
+  // - Cooldown enforcement (30 min per event type)
+  // - Confidence-based filtering
+  // - Single alert selection (highest level + highest confidence + most recent)
+  // - Soft language application (no technical jargon)
+  // - No exposure of raw scores/evidence
+  return selectPrimaryAlert(events, language);
+}
+
+/**
+ * ✨ Phase 4 Enhanced: Generate status view model with consumer presentation
+ *
+ * Changes from Phase 3:
+ * - primary_alert is now PresentedAlert (not BehaviorText)
+ * - Raw confidence_score not exposed to UI layer
+ * - Soft language applied throughout
+ * - Single primary alert enforced
+ */
+export function generateStatusViewModel(
+  events: BehaviorEvent[],
+  dailySummary: DailyBehaviorSummaryInput,
+  language: 'en' | 'zh' = 'en',
+  // Phase 3: Optional sensor data for real-time fusion
+  sensorData?: {
+    fp2?: FP2SensorData;
+    sleepTracker?: SleepTrackerData;
+    doorSensor?: DoorSensorData;
+    hallwaySensor?: HallwaySensorData;
+  }
+): StatusViewModel {
+  // Phase 3: If sensor data provided, generate anomaly events and merge
+  let allEvents = [...events];
+  let sensorFusionInfo: any = undefined;
+
+  if (sensorData) {
+    const sensorGeneratedEvents = analyzeSensorDataAndGenerateEvents(
+      sensorData.fp2,
+      sensorData.sleepTracker,
+      sensorData.doorSensor,
+      sensorData.hallwaySensor,
+      language
+    );
+
+    allEvents = [...events, ...sensorGeneratedEvents];
+
+    sensorFusionInfo = {
+      enabled: true,
+      sensor_count: Object.values(sensorData).filter(v => v).length,
+      last_analysis: new Date().toISOString(),
+    };
+  }
+
+  // ✨ Phase 4: Use alert presentation layer instead of raw BehaviorEvent
+  const presentedAlert = getPrimaryPresentedAlert(allEvents, language);
+
+  // Get suppression stats (for analytics/logging only)
+  const alertStats = countSuppressedAlerts(allEvents, language);
+
+  // ... rest of existing logic (unchanged) ...
+  const overall_status = dailySummary.highest_risk;
+  const daily_summary = generateDailySummaryText(dailySummary, language);
+
+  const latestEvent = allEvents.length > 0 ? allEvents[allEvents.length - 1] : null;
+  const current_state = latestEvent
+    ? {
+        label: getCurrentStateLabel(latestEvent, language),
+        summary: generateBehaviorText(latestEvent, language).summary,
+      }
+    : {
+        label: language === 'en' ? 'Location unknown' : '位置未知',
+        summary: language === 'en' ? 'No activity recorded.' : '暂无活动记录。',
+      };
+
+  const state_context = generateStateContext(allEvents, dailySummary);
+
+  const { show_state_notice, state_notice_text } = determineNoticeDisplay(
+    state_context,
+    presentedAlert,
+    language
+  );
+
+  const recent_behavior_texts = getRecentBehaviorTexts(allEvents, 4, language);
+
+  // Build view model with Phase 4 presentation layer
+  const viewModel: StatusViewModel = {
+    overall_status,
+    headline: daily_summary.headline,
+    current_state,
+    primary_alert: presentedAlert
+      ? {
+          // ✨ Phase 4: Simplified alert structure (no raw scores)
+          title: presentedAlert.headline,
+          summary: presentedAlert.description,
+          detail: presentedAlert.suggestion,
+          suggestion: presentedAlert.suggestion,
+          display_level: mapConsumerLevelToRiskLevel(presentedAlert.level),
+          event_id: presentedAlert.source_event_id,
+          // ✨ Note: evidence_sources NOT exposed in presentation
+          confidence_score: undefined, // ✨ Not shown to user
+        }
+      : null,
+    recent_behavior_texts,
+    daily_summary,
+    state_context,
+    trend_metrics: {
+      recent_3day_avg: state_context.consecutive_anomaly_days > 0 ? 120 : 180,
+      previous_3day_avg: 180,
+      drop_ratio: state_context.activity_drop_ratio,
+      trend: state_context.activity_trend,
+    },
+    evidence_sources: state_context.evidence,
+    show_state_notice,
+    state_notice_text,
+    // ✨ Phase 4: Add alert presentation stats
+    alert_presentation: {
+      primary_count: presentedAlert ? 1 : 0,
+      suppressed_count: alertStats.suppressed_count,
+      level: presentedAlert?.level,
+    },
+    sensor_fusion_info: sensorFusionInfo,
+    metadata: {
+      total_events: allEvents.length,
+      alert_count: dailySummary.alerts_count,
+      last_update_time: new Date().toLocaleString(
+        language === 'en' ? 'en-US' : 'zh-CN'
+      ),
+    },
+  };
+
+  return viewModel;
+}
+
+/**
+ * ✨ Phase 4: Helper to map ConsumerAlertLevel back to RiskLevel for UI styling
+ */
+function mapConsumerLevelToRiskLevel(level: ConsumerAlertLevel): RiskLevel {
+  switch (level) {
+    case 'check_now':
+      return 'high';
+    case 'attention':
+      return 'attention';
+    case 'no_concern':
+    default:
+      return 'normal';
+  }
+}
+
+/**
+ * ✨ Phase 4: Simplified notice display logic
+ * With presentation layer, we show notices less often (only for state changes)
+ */
+function determineNoticeDisplay(
+  state_context: any,
+  presentedAlert: PresentedAlert | null,
+  language: 'en' | 'zh' = 'en'
+) {
+  // Only show notice for state changes, not for every alert
+  if (state_context.current_state === 'persistent_low_activity') {
+    return {
+      show_state_notice: true,
+      state_notice_text: getStateNoticeText('persistent_low_activity', language),
+    };
+  }
+
+  if (state_context.current_state === 'recovery') {
+    return {
+      show_state_notice: true,
+      state_notice_text: getStateNoticeText('recovery', language),
+    };
+  }
+
+  return {
+    show_state_notice: false,
+    state_notice_text: undefined,
+  };
+}
+
+/**
+ * Get recent behavior texts (unchanged from Phase 3)
+ */
+function getRecentBehaviorTexts(
+  events: BehaviorEvent[],
+  count: number = 4,
+  language: 'en' | 'zh' = 'en'
+) {
+  const recentEvents = events.slice(Math.max(0, events.length - count));
+  return recentEvents.map((event) => generateBehaviorText(event, language));
+}
+
+/**
+ * [All other Phase 3 helper functions remain unchanged below]
+ * - constructCurrentSensorSnapshot()
+ * - constructSensorHistory()
+ * - isNightTime()
+ * - convertAnomalyEventToBehaviorEvent()
+ * - analyzeSensorDataAndGenerateEvents()
+ * ... [include all Phase 3 code] ...
+ */
+
+// ========== Phase 3 Helper Functions ==========
+
+function constructCurrentSensorSnapshot(
+  currentFP2Data?: FP2SensorData,
+  currentSleepTrackerData?: SleepTrackerData,
+  currentDoorSensorData?: DoorSensorData,
+  currentHallwaySensorData?: HallwaySensorData
+): SensorSnapshot {
+  return {
+    timestamp: new Date().toISOString(),
+    fp2: currentFP2Data,
+    sleep_tracker: currentSleepTrackerData,
+    door_sensor: currentDoorSensorData,
+    hallway_sensor: currentHallwaySensorData,
+    data_completeness: {
+      fp2_available: !!currentFP2Data,
+      sleep_tracker_available: !!currentSleepTrackerData,
+      door_sensor_available: !!currentDoorSensorData,
+      hallway_sensor_available: !!currentHallwaySensorData,
+    },
+  };
+}
+
+function constructSensorHistory(): SensorHistory {
+  return {
+    last_hour: [],
+    last_24h_summary: {
+      total_bed_exit_count: 0,
+      total_bed_exit_duration_minutes: 0,
+      total_hallway_passages: 0,
+      total_medication_cabinet_accesses: 0,
+      entry_door_open_count: 0,
+      average_fp2_presence_percentage: 0,
+    },
+    last_7days_pattern: {
+      typical_sleep_start_hour: 22,
+      typical_sleep_end_hour: 7,
+      typical_activity_hours: [8, 12, 18],
+      typical_bed_exit_count: 3,
+      typical_medication_time_hours: [8, 12, 18],
+    },
+  };
+}
+
+function isNightTime(): boolean {
+  const hour = new Date().getHours();
+  return hour >= SENSOR_CONFIG.sleep_tracker.night_start_hour ||
+         hour < SENSOR_CONFIG.sleep_tracker.night_end_hour;
+}
+
+function convertAnomalyEventToBehaviorEvent(
+  anomaly: AnomalyEvent,
+  language: 'en' | 'zh' = 'en'
+): BehaviorEvent {
+  const eventTypeMap: Record<string, string> = {
+    no_activity_confirmed: 'no_activity',
+    night_bed_exit_no_return: 'night_wake',
+    path_interrupted: 'path_interrupted',
+    medication_cabinet_accessed: 'medication_cabinet_accessed',
+    medication_window_missed: 'medication_missed',
+    medication_access_without_followup: 'medication_without_followup',
+    bathroom_risk_elevated: 'bathroom_long_stay',
+    unknown_location: 'unknown_location',
+  };
+
+  const eventType = eventTypeMap[anomaly.anomaly_type] || 'unknown_location';
+  const riskLevel = anomaly.risk_level === 'high' ? 'high' :
+                    anomaly.risk_level === 'attention' ? 'attention' :
+                    'normal';
+
+  return {
+    event_id: anomaly.id,
+    event_type: eventType as any,
+    timestamp: anomaly.timestamp,
+    start_time: anomaly.timestamp,
+    end_time: anomaly.timestamp,
+    location: (anomaly.detail?.current_fp2_location as any) || 'unknown',
+    risk_level: riskLevel as RiskLevel,
+    confidence_score: anomaly.confidence_score,
+    source: 'sensor_fusion',
+    detail: anomaly.detail,
+    evidence_sources: anomaly.evidence_sources,
+  };
+}
+
+function analyzeSensorDataAndGenerateEvents(
+  currentFP2?: FP2SensorData,
+  currentSleepTracker?: SleepTrackerData,
+  currentDoorSensor?: DoorSensorData,
+  currentHallwaySensor?: HallwaySensorData,
+  language: 'en' | 'zh' = 'en'
+): BehaviorEvent[] {
+  const snapshot = constructCurrentSensorSnapshot(
+    currentFP2,
+    currentSleepTracker,
+    currentDoorSensor,
+    currentHallwaySensor
+  );
+
+  const history = constructSensorHistory();
+
+  const anomalies = analyzeAllAnomalies(snapshot, history, {
+    fp2_inactivity_minutes: SENSOR_CONFIG.fp2.inactivity_threshold_minutes,
+    night_bed_exit_minutes: SENSOR_CONFIG.sleep_tracker.night_bed_exit_threshold_minutes,
+    path_interrupted_seconds: SENSOR_CONFIG.hallway.expected_transit_time_seconds,
+    bathroom_extended_minutes: SENSOR_CONFIG.anomaly_detection.bathroom_long_stay_minutes,
+    medication_hours: SENSOR_CONFIG.door_sensor.medication_typical_hours,
+  });
+
+  const generatedEvents: BehaviorEvent[] = [];
+
+  for (const anomaly of anomalies) {
+    const confidence =
+      anomaly.confidence_score ||
+      calculateConfidenceScore(
+        { risk_level: anomaly.risk_level } as any,
+        anomaly.evidence_sources.length,
+        isNightTime()
+      );
+
+    const { should_alert } = shouldPushAlert(
+      convertAnomalyEventToBehaviorEvent(anomaly, language),
+      anomaly.evidence_sources.length
+    );
+
+    if (!should_alert) {
+      console.log(`[Sensor Fusion] Alert suppressed: ${anomaly.anomaly_type}`);
+      continue;
+    }
+
+    const behaviorEvent = convertAnomalyEventToBehaviorEvent(anomaly, language);
+    behaviorEvent.confidence_score = confidence;
+
+    generatedEvents.push(behaviorEvent);
+  }
+
+  return generatedEvents;
+}
+
+// ========== Unchanged Helper Functions ==========
+
+export function hasAlert(viewModel: StatusViewModel): boolean {
+  return viewModel.primary_alert !== null;
+}
+
+export function getStatusBgColor(overallStatus: string): string {
+  switch (overallStatus) {
+    case 'normal':
+      return 'bg-green-50 border-green-200';
+    case 'attention':
+      return 'bg-yellow-50 border-yellow-200';
+    case 'high':
+      return 'bg-red-50 border-red-200';
+    default:
+      return 'bg-gray-50 border-gray-200';
+  }
+}
+
+export function getStatusTextColor(overallStatus: string): string {
+  switch (overallStatus) {
+    case 'normal':
+      return 'text-green-700';
+    case 'attention':
+      return 'text-yellow-700';
+    case 'high':
+      return 'text-red-700';
+    default:
+      return 'text-gray-700';
+  }
+}
+
+export function getStatusBadgeColor(overallStatus: string): string {
+  switch (overallStatus) {
+    case 'normal':
+      return 'bg-green-100 text-green-800';
+    case 'attention':
+      return 'bg-yellow-100 text-yellow-800';
+    case 'high':
+      return 'bg-red-100 text-red-800';
+    default:
+      return 'bg-gray-100 text-gray-800';
+  }
+}
+
+export function getStatusBadgeText(
+  overallStatus: string,
+  language: 'en' | 'zh' = 'en'
+): string {
+  const texts = {
+    en: {
+      normal: '✓ All good',
+      attention: '⚠️ Needs attention',
+      high: '🚨 Needs immediate care',
+    },
+    zh: {
+      normal: '✓ 状态良好',
+      attention: '⚠️ 需要关注',
+      high: '🚨 高风险',
+    },
+  };
+
+  return texts[language][overallStatus as keyof typeof texts['en']] || '○ Unknown';
+}

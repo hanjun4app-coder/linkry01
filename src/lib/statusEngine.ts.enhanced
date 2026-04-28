@@ -1,0 +1,565 @@
+/**
+ * ✨ ENHANCED: Status Engine with Sensor Fusion Integration
+ *
+ * This file integrates the multi-sensor fusion system into the existing
+ * status engine pipeline. Changes are backward compatible - existing code
+ * continues to work, while new sensor data can be optionally provided.
+ */
+
+import {
+  BehaviorEvent,
+  DailyBehaviorSummaryInput,
+  RiskLevel,
+} from '@/types/behavior';
+import { StatusViewModel } from '@/types/status';
+import {
+  generateBehaviorText,
+  generateDailySummaryText,
+  getCurrentStateLabel,
+  isAlertEvent,
+} from './behaviorText';
+import {
+  generateStateContext,
+  getStateNoticeText,
+} from './stateEngine';
+
+// ✨ NEW: Sensor fusion imports
+import {
+  analyzeAllAnomalies,
+} from '@/lib/sensorFusion';
+import { SENSOR_CONFIG } from '@/config/sensorConfig';
+import {
+  SensorSnapshot,
+  SensorHistory,
+  AnomalyEvent,
+  FP2SensorData,
+  SleepTrackerData,
+  DoorSensorData,
+  HallwaySensorData,
+} from '@/types/sensor';
+import { shouldPushAlert } from '@/lib/alertPipeline';
+import { calculateConfidenceScore } from '@/lib/confidenceScorer';
+
+/**
+ * ✨ NEW: Construct current sensor snapshot from data sources
+ *
+ * In production, these would come from:
+ * - FP2 API/MQTT feed
+ * - Sleep Tracker API
+ * - Door Sensor API
+ * - Hallway PIR/Radar API
+ */
+function constructCurrentSensorSnapshot(
+  currentFP2Data?: FP2SensorData,
+  currentSleepTrackerData?: SleepTrackerData,
+  currentDoorSensorData?: DoorSensorData,
+  currentHallwaySensorData?: HallwaySensorData
+): SensorSnapshot {
+  return {
+    timestamp: new Date().toISOString(),
+    fp2: currentFP2Data,
+    sleep_tracker: currentSleepTrackerData,
+    door_sensor: currentDoorSensorData,
+    hallway_sensor: currentHallwaySensorData,
+    data_completeness: {
+      fp2_available: !!currentFP2Data,
+      sleep_tracker_available: !!currentSleepTrackerData,
+      door_sensor_available: !!currentDoorSensorData,
+      hallway_sensor_available: !!currentHallwaySensorData,
+    },
+  };
+}
+
+/**
+ * ✨ NEW: Construct historical sensor data for pattern analysis
+ *
+ * This would aggregate data from the past hour, day, and week.
+ * In production: fetch from time-series database
+ */
+function constructSensorHistory(): SensorHistory {
+  // TODO: Fetch from time-series database (InfluxDB, Prometheus, etc.)
+  // For now, return default structure
+  return {
+    last_hour: [],
+    last_24h_summary: {
+      total_bed_exit_count: 0,
+      total_bed_exit_duration_minutes: 0,
+      total_hallway_passages: 0,
+      total_medication_cabinet_accesses: 0,
+      entry_door_open_count: 0,
+      average_fp2_presence_percentage: 0,
+    },
+    last_7days_pattern: {
+      typical_sleep_start_hour: 22,
+      typical_sleep_end_hour: 7,
+      typical_activity_hours: [8, 12, 18],
+      typical_bed_exit_count: 3,
+      typical_medication_time_hours: [8, 12, 18],
+    },
+  };
+}
+
+/**
+ * ✨ NEW: Helper to check if current time is night
+ */
+function isNightTime(): boolean {
+  const hour = new Date().getHours();
+  return hour >= SENSOR_CONFIG.sleep_tracker.night_start_hour ||
+         hour < SENSOR_CONFIG.sleep_tracker.night_end_hour;
+}
+
+/**
+ * ✨ NEW: Convert AnomalyEvent to BehaviorEvent for compatibility
+ *
+ * This creates a bridge between the sensor fusion output and the
+ * existing event processing pipeline.
+ */
+function convertAnomalyEventToBehaviorEvent(
+  anomaly: AnomalyEvent,
+  language: 'en' | 'zh' = 'en'
+): BehaviorEvent {
+  // Map anomaly_type to event_type
+  const eventTypeMap: Record<string, string> = {
+    no_activity_confirmed: 'no_activity',
+    night_bed_exit_no_return: 'night_wake',
+    path_interrupted: 'path_interrupted',
+    medication_cabinet_accessed: 'medication_cabinet_accessed',
+    medication_window_missed: 'medication_missed',
+    medication_access_without_followup: 'medication_without_followup',
+    bathroom_risk_elevated: 'bathroom_long_stay',
+    unknown_location: 'unknown_location',
+  };
+
+  const eventType = eventTypeMap[anomaly.anomaly_type] || 'unknown_location';
+
+  // Convert risk_level to match BehaviorEvent format
+  const riskLevel = anomaly.risk_level === 'high' ? 'high' :
+                    anomaly.risk_level === 'attention' ? 'attention' :
+                    'normal';
+
+  return {
+    event_id: anomaly.id,
+    event_type: eventType,
+    timestamp: anomaly.timestamp,
+    start_time: anomaly.timestamp,
+    end_time: anomaly.timestamp,
+    location: (anomaly.detail?.current_fp2_location as any) || 'unknown',
+    risk_level: riskLevel as RiskLevel,
+    confidence_score: anomaly.confidence_score,
+    source: 'sensor_fusion', // Mark as sensor fusion output
+    detail: anomaly.detail,
+    evidence_sources: anomaly.evidence_sources,
+  };
+}
+
+/**
+ * ✨ NEW: Run sensor fusion analysis and generate BehaviorEvents
+ *
+ * This is the main entry point for sensor data processing:
+ * - Constructs sensor snapshot
+ * - Calls analyzeAllAnomalies()
+ * - Runs through alert pipeline
+ * - Converts to BehaviorEvents
+ */
+function analyzeSensorDataAndGenerateEvents(
+  currentFP2?: FP2SensorData,
+  currentSleepTracker?: SleepTrackerData,
+  currentDoorSensor?: DoorSensorData,
+  currentHallwaySensor?: HallwaySensorData,
+  language: 'en' | 'zh' = 'en'
+): BehaviorEvent[] {
+  // Step 1: Construct snapshot and history
+  const snapshot = constructCurrentSensorSnapshot(
+    currentFP2,
+    currentSleepTracker,
+    currentDoorSensor,
+    currentHallwaySensor
+  );
+
+  const history = constructSensorHistory();
+
+  // Step 2: Run sensor fusion analysis
+  const anomalies = analyzeAllAnomalies(snapshot, history, {
+    fp2_inactivity_minutes: SENSOR_CONFIG.fp2.inactivity_threshold_minutes,
+    night_bed_exit_minutes: SENSOR_CONFIG.sleep_tracker.night_bed_exit_threshold_minutes,
+    path_interrupted_seconds: SENSOR_CONFIG.hallway.expected_transit_time_seconds,
+    bathroom_extended_minutes: SENSOR_CONFIG.anomaly_detection.bathroom_long_stay_minutes,
+    medication_hours: SENSOR_CONFIG.door_sensor.medication_typical_hours,
+  });
+
+  // Step 3: Process through alert pipeline and confidence scoring
+  const generatedEvents: BehaviorEvent[] = [];
+
+  for (const anomaly of anomalies) {
+    // Calculate confidence score
+    const confidence =
+      anomaly.confidence_score ||
+      calculateConfidenceScore(
+        { risk_level: anomaly.risk_level } as any,
+        anomaly.evidence_sources.length,
+        isNightTime()
+      );
+
+    // Check if should push alert
+    const { should_alert } = shouldPushAlert(
+      convertAnomalyEventToBehaviorEvent(anomaly, language),
+      anomaly.evidence_sources.length
+    );
+
+    // If alert is suppressed, skip this anomaly
+    if (!should_alert) {
+      console.log(
+        `[Sensor Fusion] Alert suppressed: ${anomaly.anomaly_type}`
+      );
+      continue;
+    }
+
+    // Convert to BehaviorEvent
+    const behaviorEvent = convertAnomalyEventToBehaviorEvent(anomaly, language);
+    behaviorEvent.confidence_score = confidence;
+
+    generatedEvents.push(behaviorEvent);
+  }
+
+  return generatedEvents;
+}
+
+/**
+ * 生成页面状态视图模型
+ * ✨ ENHANCED: Now integrates sensor fusion data
+ *
+ * This is the main entry point for generating the dashboard view.
+ * Can accept optional sensor data for real-time fusion analysis.
+ *
+ * @param events - 行为事件数组（existing events）
+ * @param dailySummary - 今日摘要数据
+ * @param language - 语言（默认英文）
+ * @param sensorData - ✨ NEW: Current sensor readings (optional)
+ * @returns 页面需要展示的所有数据
+ */
+export function generateStatusViewModel(
+  events: BehaviorEvent[],
+  dailySummary: DailyBehaviorSummaryInput,
+  language: 'en' | 'zh' = 'en',
+  // ✨ NEW: Optional sensor data for real-time fusion
+  sensorData?: {
+    fp2?: FP2SensorData;
+    sleepTracker?: SleepTrackerData;
+    doorSensor?: DoorSensorData;
+    hallwaySensor?: HallwaySensorData;
+  }
+): StatusViewModel {
+  // ✨ NEW: If sensor data provided, generate anomaly events and merge
+  let allEvents = [...events];
+  let sensorFusionInfo: any = undefined;
+
+  if (sensorData) {
+    const sensorGeneratedEvents = analyzeSensorDataAndGenerateEvents(
+      sensorData.fp2,
+      sensorData.sleepTracker,
+      sensorData.doorSensor,
+      sensorData.hallwaySensor,
+      language
+    );
+
+    // Merge with existing events (sensor fusion events added at end for recency)
+    allEvents = [...events, ...sensorGeneratedEvents];
+
+    // Track sensor fusion status
+    sensorFusionInfo = {
+      enabled: true,
+      sensor_count: Object.values(sensorData).filter(v => v).length,
+      last_analysis: new Date().toISOString(),
+    };
+  }
+
+  // ✨ Rest of the existing logic remains the same, using allEvents instead of events
+
+  // 1. 获取整体状态等级
+  const overall_status = dailySummary.highest_risk;
+
+  // 2. 生成今日摘要文案
+  const daily_summary = generateDailySummaryText(dailySummary, language);
+
+  // 3. 获取当前状态（基于最新事件）
+  const latestEvent = allEvents.length > 0 ? allEvents[allEvents.length - 1] : null;
+  const current_state = latestEvent
+    ? {
+        label: getCurrentStateLabel(latestEvent, language),
+        summary: generateBehaviorText(latestEvent, language).summary,
+      }
+    : {
+        label: language === 'en' ? 'Location unknown' : '位置未知',
+        summary: language === 'en' ? 'No activity recorded.' : '暂无活动记录。',
+      };
+
+  // ✨ 4. 生成状态上下文
+  const state_context = generateStateContext(allEvents, dailySummary);
+
+  // ✨ 5. 计算是否显示提醒和提示
+  const { primary_alert, show_state_notice, state_notice_text } =
+    determineAlertAndNoticeDisplay(
+      allEvents,
+      state_context,
+      language
+    );
+
+  // 6. 获取最近的行为记录（3-5 条）
+  const recent_behavior_texts = getRecentBehaviorTexts(allEvents, 4, language);
+
+  // 7. 构建视图模型
+  const viewModel: StatusViewModel = {
+    overall_status,
+    headline: daily_summary.headline,
+    current_state,
+    primary_alert,
+    recent_behavior_texts,
+    daily_summary,
+    state_context,
+    trend_metrics: {
+      recent_3day_avg: state_context.consecutive_anomaly_days > 0 ? 120 : 180,
+      previous_3day_avg: 180,
+      drop_ratio: state_context.activity_drop_ratio,
+      trend: state_context.activity_trend,
+    },
+    evidence_sources: state_context.evidence,
+    show_state_notice,
+    state_notice_text,
+    // ✨ NEW: Add sensor fusion indicators
+    ...(sensorFusionInfo && { sensor_fusion_info: sensorFusionInfo }),
+    metadata: {
+      total_events: allEvents.length,
+      alert_count: dailySummary.alerts_count,
+      last_update_time: new Date().toLocaleString(
+        language === 'en' ? 'en-US' : 'zh-CN'
+      ),
+    },
+  };
+
+  return viewModel;
+}
+
+/**
+ * 确定是否显示主提醒和状态提示
+ * 核心规则：
+ * - persistent_low_activity: 不显示主提醒，显示状态提示
+ * - 其他异常状态：显示主提醒
+ */
+function determineAlertAndNoticeDisplay(
+  events: BehaviorEvent[],
+  state_context: any,
+  language: 'en' | 'zh' = 'en'
+) {
+  // ✨ 修复规则：ActivityState 和 risk_level 分层
+  // 获取主提醒（基于 risk_level）
+  const primary_alert = getPrimaryAlert(events, language);
+
+  // 检查是否有新的 high risk 事件
+  const hasHighRiskAlert =
+    primary_alert !== null &&
+    events.some((e) => isAlertEvent(e) && e.risk_level === 'high');
+
+  // 规则 1：有新的 high risk 事件 → 必须显示主提醒（无论状态如何）
+  if (hasHighRiskAlert) {
+    return {
+      primary_alert,
+      show_state_notice:
+        state_context.current_state === 'persistent_low_activity' ||
+        state_context.current_state === 'recovery',
+      state_notice_text:
+        state_context.current_state === 'persistent_low_activity'
+          ? getStateNoticeText('persistent_low_activity', language)
+          : state_context.current_state === 'recovery'
+            ? getStateNoticeText('recovery', language)
+            : undefined,
+    };
+  }
+
+  // 规则 2：持续低活动但无 high risk → 不显示主提醒，显示状态提示
+  if (state_context.current_state === 'persistent_low_activity') {
+    return {
+      primary_alert: null,
+      show_state_notice: true,
+      state_notice_text: getStateNoticeText(
+        'persistent_low_activity',
+        language
+      ),
+    };
+  }
+
+  // 规则 3：恢复状态 → 显示主提醒和恢复提示
+  if (state_context.current_state === 'recovery') {
+    return {
+      primary_alert,
+      show_state_notice: true,
+      state_notice_text: getStateNoticeText('recovery', language),
+    };
+  }
+
+  // 规则 4：其他情况 → 正常显示主提醒
+  return {
+    primary_alert,
+    show_state_notice: false,
+    state_notice_text: undefined,
+  };
+}
+
+/**
+ * 获取主要异常提醒
+ * 规则：
+ * 1. 只考虑 alert 事件（risk_level 为 attention 或 high）
+ * 2. 优先选择 high，其次选择 attention
+ * 3. 同级别中选择时间最近的
+ *
+ * @param events - 行为事件数组
+ * @param language - 语言
+ * @returns 主异常提醒或 null
+ */
+function getPrimaryAlert(
+  events: BehaviorEvent[],
+  language: 'en' | 'zh' = 'en'
+) {
+  // 过滤出所有 alert 事件
+  const alertEvents = events.filter((event) => isAlertEvent(event));
+
+  if (alertEvents.length === 0) {
+    return null;
+  }
+
+  // 按风险等级排序（high > attention），然后按时间排序（最新优先）
+  const sortedAlerts = [...alertEvents].sort((a, b) => {
+    // 先按风险等级排序
+    const riskOrder = { high: 3, attention: 2, normal: 1 };
+    const riskCompare =
+      (riskOrder[b.risk_level as RiskLevel] ?? 0) -
+      (riskOrder[a.risk_level as RiskLevel] ?? 0);
+
+    if (riskCompare !== 0) {
+      return riskCompare;
+    }
+
+    // 同级别则按时间排序（最新优先）
+    const aTime = new Date(a.start_time ?? 0).getTime();
+    const bTime = new Date(b.start_time ?? 0).getTime();
+    return bTime - aTime;
+  });
+
+  // 返回优先级最高的 alert 的文案
+  const topAlert = sortedAlerts[0];
+  return generateBehaviorText(topAlert, language);
+}
+
+/**
+ * 获取最近的行为记录文案
+ * 返回最近 N 条事件的文案
+ *
+ * @param events - 行为事件数组
+ * @param count - 需要返回的数量（默认 4）
+ * @param language - 语言
+ * @returns 最近的行为文案数组
+ */
+function getRecentBehaviorTexts(
+  events: BehaviorEvent[],
+  count: number = 4,
+  language: 'en' | 'zh' = 'en'
+) {
+  // 取最后 N 条事件
+  const recentEvents = events.slice(Math.max(0, events.length - count));
+
+  // 生成文案
+  return recentEvents.map((event) => generateBehaviorText(event, language));
+}
+
+/**
+ * 判断页面是否应该显示异常提醒卡片
+ *
+ * @param viewModel - 状态视图模型
+ * @returns true 如果有异常提醒
+ */
+export function hasAlert(viewModel: StatusViewModel): boolean {
+  return viewModel.primary_alert !== null;
+}
+
+/**
+ * 获取页面背景色类（基于整体状态）
+ *
+ * @param overallStatus - 整体状态
+ * @returns Tailwind CSS 类名
+ */
+export function getStatusBgColor(overallStatus: string): string {
+  switch (overallStatus) {
+    case 'normal':
+      return 'bg-green-50 border-green-200';
+    case 'attention':
+      return 'bg-yellow-50 border-yellow-200';
+    case 'high':
+      return 'bg-red-50 border-red-200';
+    default:
+      return 'bg-gray-50 border-gray-200';
+  }
+}
+
+/**
+ * 获取状态文本色类（基于整体状态）
+ *
+ * @param overallStatus - 整体状态
+ * @returns Tailwind CSS 类名
+ */
+export function getStatusTextColor(overallStatus: string): string {
+  switch (overallStatus) {
+    case 'normal':
+      return 'text-green-700';
+    case 'attention':
+      return 'text-yellow-700';
+    case 'high':
+      return 'text-red-700';
+    default:
+      return 'text-gray-700';
+  }
+}
+
+/**
+ * 获取状态徽章色类（基于整体状态）
+ *
+ * @param overallStatus - 整体状态
+ * @returns Tailwind CSS 类名
+ */
+export function getStatusBadgeColor(overallStatus: string): string {
+  switch (overallStatus) {
+    case 'normal':
+      return 'bg-green-100 text-green-800';
+    case 'attention':
+      return 'bg-yellow-100 text-yellow-800';
+    case 'high':
+      return 'bg-red-100 text-red-800';
+    default:
+      return 'bg-gray-100 text-gray-800';
+  }
+}
+
+/**
+ * 获取状态徽章文本（基于整体状态）
+ *
+ * @param overallStatus - 整体状态
+ * @param language - 语言
+ * @returns 徽章显示文本
+ */
+export function getStatusBadgeText(
+  overallStatus: string,
+  language: 'en' | 'zh' = 'en'
+): string {
+  const texts = {
+    en: {
+      normal: '✓ All good',
+      attention: '⚠️ Needs attention',
+      high: '🚨 Needs immediate care',
+    },
+    zh: {
+      normal: '✓ 状态良好',
+      attention: '⚠️ 需要关注',
+      high: '🚨 高风险',
+    },
+  };
+
+  return texts[language][overallStatus as keyof typeof texts['en']] || '○ Unknown';
+}
