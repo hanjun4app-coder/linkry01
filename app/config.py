@@ -1,6 +1,7 @@
 """配置管理"""
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
+from sqlalchemy.engine import URL
 from typing import List
 import os
 
@@ -16,7 +17,7 @@ class Settings(BaseSettings):
 
     # 数据库
     POSTGRES_USER: str = "elderly_admin"
-    POSTGRES_PASSWORD: str = "password"
+    POSTGRES_PASSWORD: str = ""
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_DB: str = "elderly_care"
@@ -31,9 +32,35 @@ class Settings(BaseSettings):
     SECRET_KEY: str = Field(..., description="Must be set from environment or .env file")
     API_KEY: str = Field(..., description="Must be set from environment or .env file")
     # ✅ 修复: CORS 白名单，不再允许 "*"
+    # 生产环境：https://safehome-frontend.vercel.app
+    # 本地开发：http://localhost:3000
     ALLOW_ORIGINS: List[str] = Field(
-        default=["http://localhost:3000"],
-        description="Allowed CORS origins - must be configured in production"
+        default=[
+            "http://localhost:3000",
+            "http://localhost:3007",
+            "http://localhost:3008",
+            "http://localhost:3009",
+            "http://localhost:3010",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:3007",
+            "http://127.0.0.1:3008",
+            "http://127.0.0.1:3009",
+            "http://127.0.0.1:3010",
+            "https://safehome-frontend.vercel.app",
+            "https://safehome.linkrytech.com",
+            "https://www.linkrytech.com",
+        ],
+        description="Allowed CORS origins - updated for production (localhost for development)"
+    )
+
+    # 前端 URL（用于邮件链接等）
+    FRONTEND_BASE_URL: str = Field(
+        default="https://safehome.linkrytech.com",
+        description="Frontend base URL for email links"
+    )
+    FRONTEND_URL: str = Field(
+        default="https://safehome-frontend.vercel.app",
+        description="Legacy frontend URL for email links"
     )
 
     # Home Assistant
@@ -42,11 +69,18 @@ class Settings(BaseSettings):
 
     # 告警配置
     ALERT_EMAIL_ENABLED: bool = False
+    SMTP_HOST: str = "smtp.gmail.com"
     SMTP_SERVER: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_APP_PASSWORD: str = ""
     SMTP_USERNAME: str = ""
     SMTP_PASSWORD: str = ""
-    SMTP_FROM: str = "alerts@elderly-care.com"
+    SMTP_FROM: str = "SafeHome <your_email@gmail.com>"
+    MAILGUN_API_KEY: str = ""
+    MAILGUN_DOMAIN: str = ""
+    MAILGUN_FROM: str = ""
+    INTERNAL_NOTIFICATION_EMAIL: str = ""
 
     DINGDING_WEBHOOK_URL: str = ""
     WECHAT_WEBHOOK_URL: str = ""
@@ -78,7 +112,14 @@ class Settings(BaseSettings):
         """获取数据库 URL"""
         if self.DATABASE_URL:
             return self.DATABASE_URL
-        return f"postgresql+psycopg2://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        return URL.create(
+            drivername="postgresql+psycopg2",
+            username=self.POSTGRES_USER,
+            password=self.POSTGRES_PASSWORD,
+            host=self.POSTGRES_HOST,
+            port=self.POSTGRES_PORT,
+            database=self.POSTGRES_DB,
+        )
 
     @field_validator('ALLOW_ORIGINS')
     @classmethod
