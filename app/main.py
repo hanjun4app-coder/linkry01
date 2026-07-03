@@ -186,16 +186,18 @@ async def home_assistant_webhook(request: Request):
     # ✅ 签名验证通过，处理数据
     try:
         data = json.loads(body)
-        logger.info(f"Received valid Home Assistant webhook")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    logger.info("Received valid Home Assistant webhook")
 
     # 这里可以添加将 HA 事件转换为标准事件的逻辑
     from app.database import SessionLocal
     from app.services import EventService
     from app.schemas import EventCreate, EventType, DeviceType
 
+    db = SessionLocal()
     try:
-        db = SessionLocal()
-
         # 解析 Home Assistant 数据
         # 示例: {"entity_id": "binary_sensor.bedroom_motion", "state": "on", ...}
         event = EventCreate(
@@ -210,7 +212,6 @@ async def home_assistant_webhook(request: Request):
         )
 
         response = EventService.create_event(db, event)
-        db.close()
 
         return {
             "status": "success",
@@ -218,9 +219,13 @@ async def home_assistant_webhook(request: Request):
             "message": "Event received and processed",
             "timestamp": datetime.utcnow().isoformat()
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error processing Home Assistant webhook: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        db.close()
 
 
 # ==================== 错误处理 ====================

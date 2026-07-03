@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 import jwt
 from fastapi import HTTPException, Depends, status
-from fastapi.security import HTTPBearer, HTTPAuthCredential
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from app.config import settings
 import logging
@@ -63,7 +63,7 @@ def create_access_token(
         )
 
 
-async def verify_token(credentials: HTTPAuthCredential = Depends(security)) -> TokenPayload:
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> TokenPayload:
     """
     验证 JWT token
 

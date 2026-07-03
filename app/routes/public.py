@@ -7,7 +7,7 @@
 """
 
 import logging
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from app.database import get_db
@@ -61,7 +61,7 @@ class FeedbackPageData(BaseModel):
 async def get_feedback_page(
     alert_id: str,
     token: str = Query(..., description="Feedback token"),
-    db: Session = None
+    db: Session = Depends(get_db)
 ):
     """
     获取反馈表单页面
@@ -77,9 +77,6 @@ async def get_feedback_page(
     Returns:
         HTML 页面或错误信息
     """
-    if db is None:
-        db = next(get_db())
-
     try:
         # 验证令牌并获取告警信息
         result = db.execute(
@@ -136,7 +133,7 @@ async def submit_feedback(
     alert_id: str,
     feedback: FeedbackSubmission,
     token: str = Query(..., description="Feedback token"),
-    db: Session = None
+    db: Session = Depends(get_db)
 ):
     """
     提交告警反馈
@@ -161,9 +158,6 @@ async def submit_feedback(
         HTTPException: 400 - 反馈类型无效
         HTTPException: 409 - 反馈已提交
     """
-    if db is None:
-        db = next(get_db())
-
     try:
         # 验证反馈类型
         if feedback.feedback_type not in ['true_positive', 'false_positive']:

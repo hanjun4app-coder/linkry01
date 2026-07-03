@@ -13,7 +13,7 @@ from typing import List, Optional, Dict, Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.schemas import (
+from app.schemas_maintenance import (
     DailySummaryCreate,
     DailySummaryResponse,
     AlertFeedbackCreate,
